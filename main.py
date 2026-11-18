@@ -3,12 +3,16 @@
 import json
 import math
 import os
-import statistics
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta
 
 LEVELS = (0.05, 0.25, 0.50, 0.75, 0.95)
 LOG_CAP = math.log(1_000_000_000)
+LOG_FLOOR = math.log(0.01)
+Z_VALUES = (-1.645, -0.674, 0, 0.674, 1.645)
+# Preserve the reference's operation order for bit-identical floating-point results.
+HOUR_PARAMETERS = tuple((0.78 if hour <= 6 else 0.72,
+                         tuple(z * (0.08 * math.sqrt(hour - 1)) for z in Z_VALUES))
+                        for hour in range(2, 25))
 
 
 def log_viewers(value):
@@ -21,7 +25,13 @@ def hour_number(instant, day_start):
 
 
 def median(values, fallback=0.0):
-    return statistics.median(values) if values else fallback
+    if not values:
+        return fallback
+    values.sort()
+    middle = len(values) // 2
+    if len(values) % 2:
+        return values[middle]
+    return (values[middle - 1] + values[middle]) / 2
 
 
 def robust_slope(points):
@@ -38,16 +48,30 @@ def robust_slope(points):
 def launch_features(rows, day_start, first_viewers, first_channels):
     first_log = log_viewers(first_viewers)
     pre = []
+    # Only the final 24 hours affect the normal path. The older median is a
+    # fallback, so defer its timestamp parsing and logarithms until needed.
+    lower = (day_start - timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+    upper = day_start.isoformat().replace("+00:00", "Z")
     for row in rows:
+        instant = row.get("from") or row.get("at", "")
+        if not lower <= instant < upper:
+            continue
         value = row.get("viewers")
         if value is None or value <= 0:
             continue
-        offset = hour_number(row.get("from", row.get("at", "")), day_start)
+        offset = hour_number(instant, day_start)
         if -24 * 14 <= offset < 0:
             pre.append((offset, log_viewers(value), row.get("channels")))
 
     recent = [y for t, y, _ in pre if t >= -24]
-    previous = [y for t, y, _ in pre if -168 <= t < -24]
+    previous = []
+    if not recent:
+        older = (day_start - timedelta(hours=168)).isoformat().replace("+00:00", "Z")
+        for row in rows:
+            instant = row.get("from") or row.get("at", "")
+            value = row.get("viewers")
+            if older <= instant < lower and value is not None and value > 0:
+                previous.append(log_viewers(value))
     trend_points = [(t, y) for t, y, _ in pre if t >= -24]
     pre_level = median(recent, median(previous, first_log))
     trend = robust_slope(trend_points) if len(trend_points) >= 2 else 0.0
@@ -82,7 +106,11 @@ def comparable_curve(item):
     rows = item.get("hourly") or []
     curve = {}
     launch_channels = None
+    lower = (day_start - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    upper = (day_start + timedelta(hours=25)).isoformat().replace("+00:00", "Z")
     for row in rows:
+        if not lower <= row["from"] < upper:
+            continue
         offset = hour_number(row["from"], day_start)
         hour = int(round(offset))
         viewers = row.get("viewers")
@@ -116,10 +144,10 @@ def similarity(target, donor):
     return weight
 
 
-def weighted_quantile(pairs, probability):
+def weighted_quantiles(pairs):
     pairs = sorted((value, weight) for value, weight in pairs if weight > 1e-12)
     if not pairs:
-        return 0.0
+        return (0.0,) * 5
     total = sum(weight for _, weight in pairs)
     # Interpolate at weighted mid-ranks instead of returning a staircase: with
     # a modest analog pool this keeps adjacent quantiles ordered and calibrated.
@@ -128,15 +156,19 @@ def weighted_quantile(pairs, probability):
     for value, weight in pairs:
         points.append(((cumulative + 0.5 * weight) / total, value))
         cumulative += weight
-    if probability <= points[0][0]:
-        return points[0][1]
-    if probability >= points[-1][0]:
-        return points[-1][1]
-    for (left_p, left_v), (right_p, right_v) in zip(points, points[1:]):
-        if probability <= right_p:
-            fraction = (probability - left_p) / max(1e-12, right_p - left_p)
-            return left_v + fraction * (right_v - left_v)
-    return points[-1][1]
+    result = []
+    for probability in LEVELS:
+        if probability <= points[0][0]:
+            result.append(points[0][1])
+        elif probability >= points[-1][0]:
+            result.append(points[-1][1])
+        else:
+            for (left_p, left_v), (right_p, right_v) in zip(points, points[1:]):
+                if probability <= right_p:
+                    fraction = (probability - left_p) / max(1e-12, right_p - left_p)
+                    result.append(left_v + fraction * (right_v - left_v))
+                    break
+    return result
 
 
 def target_curve(case):
@@ -173,22 +205,22 @@ def forecast_case(case):
         offset = hour - 1
         pairs = [(donor["curve"][offset], donor["weight"])
                  for donor in donors if offset in donor["curve"]]
-        center = weighted_quantile(pairs, 0.50)
+        curve_quantiles = weighted_quantiles(pairs)
+        center = curve_quantiles[2]
         # Robustly temper cross-launch dispersion: extreme launch regimes inform the
         # tails, while the central forecast stays close to the matched analog median.
-        spread = 0.78 if hour <= 6 else 0.72
+        spread, floor_deviations = HOUR_PARAMETERS[hour - 2]
         # Keep uncertainty even when few historical curves carry most of the weight.
-        floor = 0.08 * math.sqrt(offset)
         logs = []
-        for level, z in zip(LEVELS, (-1.645, -0.674, 0, 0.674, 1.645)):
-            deviation = spread * (weighted_quantile(pairs, level) - center)
+        for curve_quantile, z, floor_deviation in zip(curve_quantiles, Z_VALUES, floor_deviations):
+            deviation = spread * (curve_quantile - center)
             if z:
-                deviation = math.copysign(math.hypot(deviation, z * floor), z)
+                deviation = math.copysign(math.hypot(deviation, floor_deviation), z)
             logs.append(target["first"] + center + deviation)
         quantiles = []
         previous = 0.0
         for value in logs:
-            value = max(math.log(0.01), min(LOG_CAP, value))
+            value = max(LOG_FLOOR, min(LOG_CAP, value))
             quantile = math.exp(value)
             quantile = max(previous, min(1_000_000_000.0, quantile))
             quantiles.append(round(quantile, 4))
@@ -198,15 +230,17 @@ def forecast_case(case):
 
 
 def main():
-    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for path in sorted(input_dir.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(output_dir, exist_ok=True)
+    for name in sorted(os.listdir(input_dir)):
+        if not name.endswith(".in"):
+            continue
+        with open(os.path.join(input_dir, name), encoding="utf-8") as stream:
+            case = json.load(stream)
         output = forecast_case(case)
-        (output_dir / (path.stem + ".out")).write_text(
-            json.dumps(output, separators=(",", ":"), allow_nan=False) + "\n",
-            encoding="utf-8")
+        with open(os.path.join(output_dir, name[:-3] + ".out"), "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(output, separators=(",", ":"), allow_nan=False) + "\n")
 
 
 if __name__ == "__main__":
